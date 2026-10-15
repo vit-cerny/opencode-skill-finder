@@ -228,34 +228,38 @@ export function candidates(text: string, cwd: string): string[] {
     .map((x) => x.id)
 }
 
+/** Lowercase, non-alphanumerics to single spaces, padded so phrase lookups are word-bounded. */
+export function phrase(s: string): string {
+  return " " + s.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim() + " "
+}
+
 /**
- * Auto-load is restricted to a high-precision signal: the prompt contains an id
- * token that is UNIQUE across the whole skill id set. Everything else gets a
- * hint, because the keyword filter is not reliable enough to inject a body.
+ * Auto-load is restricted to a high-precision signal: the prompt contains the
+ * skill's id as a contiguous phrase ("run ponytail", "use web-design-engineer").
+ * Everything else gets a hint, because the keyword filter is not reliable enough
+ * to inject a whole skill body.
  *
- * Two measured failures drove this:
+ * Three measured failures drove this, all caught in skill-hint.log:
  *  - a match-count gate auto-loaded `jev-browser` for "build a settings page with
  *    a dark mode toggle" and `karpathy-guidelines` for "write a changelog";
- *  - a plain id-token gate auto-loaded `find-skills` for a prompt containing the
- *    word "skills", because `skill` appears in several skill ids.
- * So: the matched id token must be unique to one skill. A wrong auto-load costs
- * the full body (5-30 KB) and steers the agent wrong.
+ *  - an id-token gate auto-loaded `find-skills` for any prompt containing the
+ *    word "skills", because `skill` appears in several skill ids;
+ *  - a unique-token gate auto-loaded `find-skills` again for the `/skills`
+ *    command, whose body contains "skill-find.ps1" and therefore the token "find".
+ * A wrong auto-load costs the full body (5-30 KB) and steers the agent wrong.
  */
 export function pick(text: string, cwd: string): { id: string; explicit: boolean; rest: string[] } | null {
   const r = rank(text, cwd)
   if (r.length === 0) return null
 
-  const q = new Set(tokens(text))
-  const df = new Map<string, number>()
-  for (const s of getIndex(cwd)) {
-    for (const t of new Set(tokens(s.id))) df.set(t, (df.get(t) ?? 0) + 1)
-  }
-  const named = (id: string) => tokens(id).some((t) => q.has(t) && df.get(t) === 1)
-
+  const q = phrase(text)
   // A skill the user actually named beats keyword ranking, even if another skill
   // scored higher (naming "security-review" used to lose to
-  // "ai-prompt-engineering-safety-review").
-  const hit = r.find((x) => named(x.id))
+  // "ai-prompt-engineering-safety-review"). The id must appear as a contiguous
+  // phrase, which is what stops this from firing on unrelated text:
+  // "/skills" ran a command body containing "skill-find.ps1", and the bare token
+  // "find" used to auto-load find-skills.
+  const hit = r.find((x) => q.includes(phrase(x.id)))
   if (hit) return { id: hit.id, explicit: true, rest: r.filter((x) => x.id !== hit.id).slice(0, MAX_HINT).map((x) => x.id) }
 
   const top = r[0]
@@ -273,7 +277,7 @@ export function hintFor(text: string, cwd: string, autoLoaded?: string | null): 
     return (
       `${MARKER} ${autoLoaded} is already loaded for this task. ` +
       (others.length ? `Other candidates: ${others.join(", ")}. If one fits better, load it with the skill tool. ` : "") +
-      `Need something else: skill-find.ps1 -Task "<task>" or -List.`
+      `Need something else: skill-find.ps1 -Task "<task>" or -List; add -Online to search the skills.sh catalog.`
     )
   }
 
@@ -281,7 +285,7 @@ export function hintFor(text: string, cwd: string, autoLoaded?: string | null): 
     `${MARKER} MANDATORY before any other tool call: load exactly one of these with the skill tool ` +
     `- ${ids.join(", ")} - or state in one line why none of them applies to this task. ` +
     `They are hidden to save context but still load by id. ` +
-    `Need a different one: skill-find.ps1 -Task "<task>" or -List.`
+    `Need a different one: skill-find.ps1 -Task "<task>" or -List; add -Online to search the skills.sh catalog.`
   )
 }
 

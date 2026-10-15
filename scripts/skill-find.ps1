@@ -40,6 +40,7 @@ param(
   [string]$Demote = "",
   [switch]$Status,
   [switch]$Online,
+  [string]$Install = "",
   [switch]$Rebuild
 )
 
@@ -336,7 +337,17 @@ function Write-Index {
     hiddenChars     = $h
     skills          = $index
   }
-  $payload | ConvertTo-Json -Depth 4 | Set-Content -Path $IndexFile -Encoding UTF8
+  # The index is a cache, not state. Two scripts running at once (a /skills next
+  # to a -Status, say) used to race on this file: "Set-Content : Stream was not
+  # readable." Write to a per-process temp file and swap it in; never fail the
+  # command because the cache could not be written.
+  try {
+    $tmp = "$IndexFile.$PID.tmp"
+    [System.IO.File]::WriteAllText($tmp, ($payload | ConvertTo-Json -Depth 4), $Utf8NoBom)
+    Move-Item -Path $tmp -Destination $IndexFile -Force
+  } catch {
+    # ignore: the caller already has the data it needs
+  }
   return $index
 }
 
@@ -431,30 +442,47 @@ function Invoke-Status {
   $adv | ForEach-Object { "  {0}" -f $_.id }
 }
 
+# Search the skills.sh catalog. Uses the CLI, not the HTTP API: the API needs a
+# Vercel OIDC token and returns 401 without one, while `npx skills find` works
+# unauthenticated. Verified 2026-10-15.
 function Invoke-Online {
   param([string]$Query)
-  # skills.sh search needs a Vercel OIDC token; without one the call is a 401.
-  # Report that plainly rather than pretending discovery worked.
-  $token = $env:VERCEL_OIDC_TOKEN
-  $uri = "https://skills.sh/api/v1/skills/search?q=" + [uri]::EscapeDataString($Query) + "&limit=5"
-  $headers = @{}
-  if ($token) { $headers["Authorization"] = "Bearer $token" }
-  try {
-    $r = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 25 -ErrorAction Stop
-    Write-Output ("catalog hits ({0}):" -f $r.searchType)
-    foreach ($hit in $r.data) { Write-Output ("  {0,-46} {1,8} installs" -f $hit.id, $hit.installs) }
-    Write-Output "install one:  npx skills add <owner/repo>"
-  } catch {
-    $code = ""
-    if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-    if ($code -eq 401) {
-      Write-Output "skills.sh catalog: 401 - the API needs a Vercel OIDC token."
-      Write-Output "install from the catalog by repo instead:  npx skills add <owner/repo>"
-      Write-Output "docs: https://www.skills.sh/docs/cli"
-    } else {
-      Write-Output ("skills.sh catalog unavailable ({0}): {1}" -f $code, $_.Exception.Message)
-    }
+  if (-not $Query) {
+    Write-Output "give a query, e.g.  -Online -Task ""react performance"""
+    return
   }
+
+  Write-Output "searching the skills.sh catalog for: $Query"
+  $raw = ""
+  try {
+    $raw = (& npx -y skills find $Query 2>&1 | Out-String)
+  } catch {
+    Write-Output "npx unavailable: $($_.Exception.Message)"
+    return
+  }
+  if (-not $raw -or -not $raw.Trim()) {
+    Write-Output "no catalog results (or no network)."
+    return
+  }
+
+  # strip ANSI colour so the output survives being piped into a transcript
+  $esc = [char]27
+  $clean = $raw -replace "$esc\[[0-9;]*m", ""
+
+  $hits = [regex]::Matches($clean, '(?m)^(?<id>[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+@[A-Za-z0-9_.\-]+)[ \t]+(?<n>[0-9.]+[KM]?) installs')
+  if ($hits.Count -eq 0) {
+    Write-Output $clean.Trim()
+    return
+  }
+
+  Write-Output ""
+  Write-Output ("catalog hits ({0}):" -f $hits.Count)
+  foreach ($h in $hits) {
+    Write-Output ("  {0,-58} {1,8} installs" -f $h.Groups["id"].Value, $h.Groups["n"].Value)
+  }
+  Write-Output ""
+  Write-Output "install one after reviewing it:  -Install <owner/repo@skill>"
+  Write-Output "nothing fits? the task does not need a skill - answer it directly."
 }
 
 # ---- dispatch ----
@@ -474,6 +502,31 @@ if ($Status -or $Rebuild) { Invoke-Status; exit 0 }
 if ($Commands) { Show-Commands; exit 0 }
 if ($Doctor) { Invoke-Doctor; exit 0 }
 if ($Log -gt 0) { Show-Log -Lines $Log; exit 0 }
+
+# Install from the catalog. Deliberately a separate, explicit step: a skill is
+# third-party instructions that later run with the agent's full permissions, so
+# it is never installed as a side effect of searching.
+if ($Install) {
+  Write-Output "installing: $Install"
+  Write-Output "(review its SKILL.md before relying on it - third-party instructions run with your agent's permissions)"
+  try {
+    $out = (& npx -y skills add $Install -g -y 2>&1 | Out-String)
+    $esc = [char]27
+    Write-Output (($out -replace "$esc\[[0-9;]*m", "").Trim())
+  } catch {
+    Write-Output "install failed: $($_.Exception.Message)"
+    exit 1
+  }
+  Write-Output ""
+  Set-Hidden -Index (Get-SkillIndex) -Hide $true
+  Invoke-Status
+  exit 0
+}
+
+if ($Online -and -not $Task) {
+  Invoke-Online -Query $Task
+  exit 0
+}
 if ($List) { Write-Index | Out-Null; Write-Output "all skills on disk:"; Show-Compact -Index (Get-SkillIndex); exit 0 }
 if ($Use) {
   if (-not ((Get-SkillIndex) | Where-Object { $_.id -eq $Use })) { Write-Output "unknown skill: $Use"; exit 1 }
