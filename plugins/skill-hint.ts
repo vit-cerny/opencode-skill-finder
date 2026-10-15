@@ -1,26 +1,44 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import { readdirSync, readFileSync, existsSync } from "node:fs"
+import { Plugin } from "@opencode/plugin"
+import { readdirSync, readFileSync, existsSync, appendFileSync, writeFileSync, statSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir } from "node:os"
 
 /**
- * skill-hint - makes the skill finder automatic.
+ * skill-hint - near-zero-token skill discovery for opencode V2.
  *
- * Every skill except `skill-finder` carries `disable-model-invocation: true`, so
- * its description is not shipped in the per-request index (53 skills: 4124
- * tokens -> 61). The cost of that win is that the model is no longer nudged by
- * skill descriptions, so this plugin does the nudging: it reads the incoming
- * user message, filters the on-disk skill index for keyword matches, and appends
- * a one-line hint naming the best candidates. The model still chooses and loads
- * exactly one skill by id.
+ * The problem: opencode ships every skill's id, name and description to the
+ * model on every request. With 53 skills that measured 16,380 chars (~4,124
+ * tokens) before you type anything.
  *
- * Budget: ~40 tokens per user message, versus ~4124 tokens per request for the
- * full advertised index.
+ * The fix has two halves:
  *
- * Never throws - a plugin error must not break a session.
+ *  1. Hiding. Every skill except `skill-finder` carries
+ *     `disable-model-invocation: true` in its frontmatter, managed by
+ *     scripts/skill-find.ps1 -Enable. That drops the index to 244 chars
+ *     (~61 tokens). Hidden skills stay registered and still load by id.
+ *
+ *  2. Nudging. Because hidden skills no longer advertise themselves, this plugin
+ *     supplies the shortlist: it filters the on-disk index against the incoming
+ *     prompt and injects the best candidates into the system prompt for the next
+ *     model call. ~40 tokens per turn. The model still chooses and loads exactly
+ *     one skill by id.
+ *
+ * Loaded as a local plugin from ~/.config/opencode/plugins/skill-hint.ts.
+ *
+ * Hard-won API notes (2026-10-15):
+ *  - opencode V2 needs `Plugin.define({ id, setup })` as the DEFAULT export from
+ *    `@opencode/plugin`. The v1 shape in `@opencode-ai/plugin` fails with
+ *    "Plugin must export a default definition with an id and an effect or setup function."
+ *  - Hiding via `ctx.skill.transform` (autoinvoke = false) was tried and REVERTED:
+ *    it hid every skill including skill-finder itself. Frontmatter hiding is used
+ *    instead and is verified.
+ *  - The hint goes into `event.system` via the `context` hook, not into the user's
+ *    message. Verified: a subagent quoted the injected line verbatim.
  */
 
 const HOME = homedir()
+const CONFIG_ROOT = join(HOME, ".config", "opencode")
+const LOG_FILE = join(CONFIG_ROOT, "skill-hint.log")
 const MARKER = "[skill-hint]"
 const TTL_MS = 60_000
 const MAX_HINT = 3
@@ -29,9 +47,26 @@ export type Skill = { id: string; name: string; desc: string; hidden: boolean }
 
 let cache: { at: number; cwd: string; skills: Skill[] } | null = null
 
+/** Append one audit line (truncated past 64 KB). Best effort, never throws. */
+function logLine(text: string) {
+  try {
+    const line = `${new Date().toISOString()} ${text}\n`
+    let size = 0
+    try {
+      size = statSync(LOG_FILE).size
+    } catch {
+      size = 0
+    }
+    if (size > 65_536) writeFileSync(LOG_FILE, line)
+    else appendFileSync(LOG_FILE, line)
+  } catch {
+    // logging must never break a session
+  }
+}
+
 export function skillRoots(cwd: string): string[] {
   const roots: string[] = [
-    join(HOME, ".config", "opencode", "skills"),
+    join(CONFIG_ROOT, "skills"),
     join(HOME, ".claude", "skills"),
     join(HOME, ".agents", "skills"),
   ]
@@ -47,6 +82,7 @@ export function skillRoots(cwd: string): string[] {
   })
 }
 
+/** Read frontmatter only - bodies reach 26 KB and are never needed here. */
 export function readFront(file: string): { name: string; desc: string; hidden: boolean } | null {
   let raw = ""
   try {
@@ -128,7 +164,7 @@ const STOP = new Set([
   "adds","added","need","needs","want","wants","please","help","how","what","why","does","doing","done",
   "also","just","like","some","more","most","very","only","other","over","under","about","after","before",
   "while","where","which","who","whom","file","files","code","work","task","thing","let","lets","now","one",
-  "two","via","per","run","runs","running","and","or","to","of","in","on","at","is","it","be","do",
+  "two","via","per","run","runs","running","to","of","in","on","at","is","it","be","do","or",
 ])
 
 export function stem(w: string): string {
@@ -157,8 +193,8 @@ export function tokens(text: string): string[] {
   return [...new Set(out)]
 }
 
-/** Token equality is too brittle after crude stemming ("brows" vs "browser"),
- *  so a query token also hits when it shares a >=4-char prefix with a hay token. */
+/** Token equality is brittle after crude stemming ("brows" vs "browser"), so a
+ *  query token also hits when it shares a >=4-char prefix with a hay token. */
 function hits(q: string, hay: Set<string>): boolean {
   if (hay.has(q)) return true
   if (q.length < 4) return false
@@ -168,6 +204,7 @@ function hits(q: string, hay: Set<string>): boolean {
   return false
 }
 
+/** Keyword filter, not a ranker. Returns at most MAX_HINT ids, best first. */
 export function candidates(text: string, cwd: string): string[] {
   const q = tokens(text)
   if (q.length === 0) return []
@@ -195,21 +232,46 @@ export function hintFor(text: string, cwd: string): string | null {
   )
 }
 
-export const SkillHintPlugin: Plugin = async ({ directory }) => {
-  return {
-    "chat.message": async (_input, output) => {
-      try {
-        const parts = (output as any)?.parts
-        if (!Array.isArray(parts)) return
-        const part = parts.find((p: any) => p?.type === "text" && typeof p.text === "string")
-        if (!part) return
-        const raw: string = part.text
-        const hint = hintFor(raw, directory)
-        if (!hint) return
-        part.text = raw + "\n\n" + hint
-      } catch {
-        // never break a session
-      }
-    },
-  }
-}
+export default Plugin.define({
+  id: "skill-hint",
+  async setup(ctx) {
+    const cwd = ctx.location?.directory ?? process.cwd()
+    const pending = new Map<string, string>()
+
+    // Compute the shortlist when a prompt is admitted.
+    try {
+      await ctx.session.hook("prompt", (event) => {
+        try {
+          const text = (event?.prompt as any)?.text ?? ""
+          const hint = hintFor(text, cwd)
+          if (hint) pending.set(event.sessionID, hint)
+          else logLine(`prompt: no candidate matched (${text.trim().slice(0, 50)})`)
+        } catch (e) {
+          logLine(`prompt hook error: ${String(e)}`)
+        }
+      })
+    } catch (e) {
+      logLine(`prompt hook registration failed: ${String(e)}`)
+    }
+
+    // Deliver into the system prompt on the next model call, then clear, so
+    // tool-driven continuations do not pay for it again.
+    try {
+      await ctx.session.hook("context", (event) => {
+        try {
+          const hint = pending.get(event.sessionID)
+          if (!hint) return
+          event.system.push({ type: "text", text: hint })
+          pending.delete(event.sessionID)
+          logLine(`delivered: ${hint.replace(`${MARKER} `, "").slice(0, 90)}`)
+        } catch (e) {
+          logLine(`context hook error: ${String(e)}`)
+        }
+      })
+    } catch (e) {
+      logLine(`context hook registration failed: ${String(e)}`)
+    }
+
+    logLine(`setup: dir=${cwd}`)
+  },
+})

@@ -106,26 +106,31 @@ directory and parent). First root that defines a name wins, matching opencode.
 Reads frontmatter only, never skill bodies. Writes a cached
 `skill-index.json`.
 
-**`plugins/skill-hint.ts`** — makes it automatic. Hooks `chat.message`, keyword-
-filters the same index against your message, and appends one line naming the top
-candidates:
+**`plugins/skill-hint.ts`** — makes it automatic. It registers two opencode V2
+session hooks in `setup()`:
+
+- `prompt` — on prompt admission, keyword-filters the same index against the
+  incoming text and stashes a shortlist for that session.
+- `context` — on the next model call, pushes the shortlist into the system
+  prompt (`event.system`), then clears it, so tool-driven continuations do not
+  pay for it again.
+
+The model sees one line, and still chooses and loads exactly one skill by id:
 
 ```
-[skill-hint] skill candidates: security-review, code-review-and-quality.
+[skill-hint] skill candidates: security-review, xlsx, ai-prompt-engineering-safety-review.
 Load exactly one with the skill tool before specialized work - they are hidden
-to save context but still load by id.
+to save context but still load by id. Need a different one: skill-find.ps1 -Task
+"<task>" or -List.
 ```
 
-~40 tokens per message, versus ~4,124 per request for the full index. The model
-still chooses and loads one skill; the plugin only supplies the shortlist. It
-never throws - a plugin error must not break a session.
+~40 tokens per turn, versus ~4,124 per request for the full index. Every
+delivery is appended to `~/.config/opencode/skill-hint.log`, so you can see what
+was suggested and when. The plugin never throws: a plugin error must not break a
+session.
 
-**Design tradeoff:** the hint is appended to the incoming user message, so it is
-visible in the transcript rather than hidden in the system prompt. That is
-deliberate - you can see which skills were suggested and why. The alternative is
-to stash it in `chat.message` and inject it in
-`experimental.chat.system.transform`, which keeps your message clean but adds an
-ordering assumption between the two hooks.
+Nothing is added to your message — the hint lives in the system prompt, so your
+transcript stays clean.
 
 ## What is deliberately not here
 
@@ -145,32 +150,63 @@ it is already in the conversation.
 bun run test/skill-hint.test.ts
 ```
 
-13 checks: index builds, hidden flags parse, stemming, three real task-to-skill
+14 checks: index builds, hidden flags parse, stemming, three real task-to-skill
 mappings, short-text and marker dedupe, no match on chit-chat, hint size.
 
+Verified end to end on a live server, not inferred:
+
+| Check | Evidence |
+|---|---|
+| Plugin loads | `opencode api GET /api/plugin` → `id=skill-hint status=active` |
+| Hooks fire | `skill-hint.log` shows `prompt: ... hint=yes` then `delivered: ...` |
+| The model sees it | a subagent was asked to quote any line containing "candidates" and returned the hint verbatim |
+| Delivered once per turn | later model calls log nothing; `pending` is cleared after delivery |
+| Hiding works | full finder scan reports 53 skills, 1 advertised, 61 tokens/request |
+| Hidden skill still loadable | `skill` tool called with `ponytail` while hidden returned its full body |
+
 The hide/restore round-trip was verified byte-identical across 78 `SKILL.md`
-files (56 CRLF, 22 LF) using SHA256. Two bugs found and fixed during that work:
+files (56 CRLF, 22 LF) using SHA256. Bugs found and fixed along the way:
 
 - PowerShell 5.1 `Set-Content -Encoding UTF8` writes a **BOM**, which breaks
   `---` frontmatter parsing. All writes go through
   `New-Object System.Text.UTF8Encoding($false)`.
 - Hardcoding CRLF on insert broke byte-identity on LF files. The insert reuses
   the file's own line ending.
+- The plugin was first written against the V1 plugin API and silently failed to
+  load. V2 needs `Plugin.define({ id, setup })` as the default export from
+  `@opencode/plugin`.
+
+## What is deliberately not here
+
+**No ranking.** An earlier version scored skills with a BM25-style ranker over
+their descriptions. It was wrong: "build a settings page with a dark mode
+toggle" matched `caveman`. Descriptions are marketing prose and do not share
+vocabulary with task descriptions. So there is a keyword **filter** (id, name,
+description) plus an on-demand compact index (~1,400 tokens for 53 skills) when
+the filter is ambiguous. The model picks - it is the better semantic matcher and
+it is already in the conversation.
+
+**No runtime hiding via `ctx.skill.transform`.** V2 exposes
+`Skill.Info.autoinvoke`, so hiding could in principle happen in the plugin with
+no file edits, which would also survive a skill sync. It was implemented and
+reverted: the transform hid *every* skill including `skill-finder` itself
+(observed 2026-10-15), leaving the roster empty. Frontmatter hiding is used
+instead. If you retry it, verify the finder survives before trusting it.
 
 ## Limits
 
-- **Not true semantic matching.** Unusual phrasing can miss. `-List` is the
-  escape hatch: print the index, let the model choose.
+- **Not true semantic matching.** Unusual phrasing can miss, and it can suggest
+  a near-miss (it offered `xlsx` for a diff-review prompt). `-List` is the escape
+  hatch: print the index, let the model choose. Load one skill per task.
 - **Skill syncs re-advertise.** `npx skills add` installs new skills with their
   descriptions advertised, so new ones cost tokens until you re-run `-Enable`.
   There is no hook for this; it is a manual step.
 - **Confined to frontmatter.** `-Enable`, `-Restore`, `-Promote` and `-Demote`
-  only insert or remove one line in the frontmatter of a `SKILL.md`. Skill
-  bodies are never touched. Edited paths are recorded in
-  `skill-find-state.json`.
+  only insert or remove one line in the frontmatter of a `SKILL.md`. Skill bodies
+  are never touched. Edited paths are recorded in `skill-find-state.json`.
 - **`skills.sh` search needs auth.** `https://skills.sh/api/v1/skills/search`
-  returns 401 without a Vercel OIDC token, so `-Online` reports that and points
-  at `npx skills add <owner/repo>` instead of pretending discovery worked.
+  returns 401 without a Vercel OIDC token, so `-Online` reports that and points at
+  `npx skills add <owner/repo>` instead of pretending discovery worked.
 - **Windows-first.** The resolver is PowerShell 5.1. The plugin is portable.
 
 ## Licence
