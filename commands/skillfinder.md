@@ -18,12 +18,17 @@ Map `$ARGUMENTS` to the script arguments:
 | a task description (default) | `-Task "<the text>"` |
 | `skills` | `-List` |
 | `commands` | `-Commands` |
-| `status` | `-Status` |
+| `stats` | `-Status` |
+| `log` | `-Log 30` |
+| `doctor` | `-Doctor` |
 | `enable` | `-Enable` then `-Status` |
 | `restore` | `-Restore` |
 | `promote` | `-Promote` |
 | `demote <id>` | `-Demote <id>` |
 | `add <owner/repo>` | `npx skills add <owner/repo>`, then `-Enable`, then `-Status` |
+
+There are also first-class commands: `/skills` (list), `/skill <task>` (find+load),
+`/skillstats`, `/skilllog`, `/skillpromote`, `/skilldoctor`.
 
 Then:
 

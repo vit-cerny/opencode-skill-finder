@@ -204,30 +204,83 @@ function hits(q: string, hay: Set<string>): boolean {
   return false
 }
 
-/** Keyword filter, not a ranker. Returns at most MAX_HINT ids, best first. */
-export function candidates(text: string, cwd: string): string[] {
+export type Ranked = { id: string; m: number }
+
+/** Keyword filter, not a ranker. Scores are match counts over id/name/description. */
+export function rank(text: string, cwd: string): Ranked[] {
   const q = tokens(text)
   if (q.length === 0) return []
-  const scored: Array<[number, string]> = []
+  const scored: Ranked[] = []
   for (const s of getIndex(cwd)) {
     if (s.id.startsWith("skill-")) continue
     const hay = new Set(tokens(`${s.id} ${s.name} ${s.desc}`))
     let m = 0
     for (const t of q) if (hits(t, hay)) m++
-    if (m > 0) scored.push([m, s.id])
+    if (m > 0) scored.push({ id: s.id, m })
   }
-  scored.sort((a, b) => b[0] - a[0] || a[1].localeCompare(b[1]))
-  return scored.slice(0, MAX_HINT).map((x) => x[1])
+  scored.sort((a, b) => b.m - a.m || a.id.localeCompare(b.id))
+  return scored
 }
 
-export function hintFor(text: string, cwd: string): string | null {
+export function candidates(text: string, cwd: string): string[] {
+  return rank(text, cwd)
+    .slice(0, MAX_HINT)
+    .map((x) => x.id)
+}
+
+/**
+ * Auto-load is restricted to a high-precision signal: the prompt contains an id
+ * token that is UNIQUE across the whole skill id set. Everything else gets a
+ * hint, because the keyword filter is not reliable enough to inject a body.
+ *
+ * Two measured failures drove this:
+ *  - a match-count gate auto-loaded `jev-browser` for "build a settings page with
+ *    a dark mode toggle" and `karpathy-guidelines` for "write a changelog";
+ *  - a plain id-token gate auto-loaded `find-skills` for a prompt containing the
+ *    word "skills", because `skill` appears in several skill ids.
+ * So: the matched id token must be unique to one skill. A wrong auto-load costs
+ * the full body (5-30 KB) and steers the agent wrong.
+ */
+export function pick(text: string, cwd: string): { id: string; explicit: boolean; rest: string[] } | null {
+  const r = rank(text, cwd)
+  if (r.length === 0) return null
+
+  const q = new Set(tokens(text))
+  const df = new Map<string, number>()
+  for (const s of getIndex(cwd)) {
+    for (const t of new Set(tokens(s.id))) df.set(t, (df.get(t) ?? 0) + 1)
+  }
+  const named = (id: string) => tokens(id).some((t) => q.has(t) && df.get(t) === 1)
+
+  // A skill the user actually named beats keyword ranking, even if another skill
+  // scored higher (naming "security-review" used to lose to
+  // "ai-prompt-engineering-safety-review").
+  const hit = r.find((x) => named(x.id))
+  if (hit) return { id: hit.id, explicit: true, rest: r.filter((x) => x.id !== hit.id).slice(0, MAX_HINT).map((x) => x.id) }
+
+  const top = r[0]
+  return { id: top.id, explicit: false, rest: r.slice(1, MAX_HINT).map((x) => x.id) }
+}
+
+export function hintFor(text: string, cwd: string, autoLoaded?: string | null): string | null {
   if (!text || text.includes(MARKER)) return null
   if (text.trim().length < 12) return null
   const ids = candidates(text, cwd)
   if (ids.length === 0) return null
+
+  if (autoLoaded) {
+    const others = ids.filter((x) => x !== autoLoaded)
+    return (
+      `${MARKER} ${autoLoaded} is already loaded for this task. ` +
+      (others.length ? `Other candidates: ${others.join(", ")}. If one fits better, load it with the skill tool. ` : "") +
+      `Need something else: skill-find.ps1 -Task "<task>" or -List.`
+    )
+  }
+
   return (
-    `${MARKER} skill candidates: ${ids.join(", ")}. ` +
-    `Load exactly one with the skill tool before specialized work - they are hidden to save context but still load by id. ` +
+    `${MARKER} MANDATORY before any other tool call: load exactly one of these with the skill tool ` +
+    `- ${ids.join(", ")} - or state in one line why none of them applies to this task. ` +
+    `They are hidden to save context but still load by id. ` +
     `Need a different one: skill-find.ps1 -Task "<task>" or -List.`
   )
 }
@@ -238,14 +291,36 @@ export default Plugin.define({
     const cwd = ctx.location?.directory ?? process.cwd()
     const pending = new Map<string, string>()
 
-    // Compute the shortlist when a prompt is admitted.
+    // On prompt admission: auto-load the best skill when the filter is
+    // confident, and queue a hint describing what was loaded. opencode resolves
+    // event.prompt.skills natively, so the skill is loaded once, up front, with
+    // no model discretion and no extra tool call.
     try {
       await ctx.session.hook("prompt", (event) => {
         try {
           const text = (event?.prompt as any)?.text ?? ""
-          const hint = hintFor(text, cwd)
+          const choice = pick(text, cwd)
+
+          if (!choice) {
+            logLine(`prompt: no candidate matched (${text.trim().slice(0, 50)})`)
+            return
+          }
+
+          let autoLoaded: string | null = null
+          if (choice.explicit) {
+            const prompt = event.prompt as any
+            if (Array.isArray(prompt.skills) || prompt.skills === undefined) {
+              prompt.skills = [...(prompt.skills ?? []), { id: choice.id }]
+              autoLoaded = choice.id
+            }
+          }
+
+          const hint = hintFor(text, cwd, autoLoaded)
           if (hint) pending.set(event.sessionID, hint)
-          else logLine(`prompt: no candidate matched (${text.trim().slice(0, 50)})`)
+          logLine(
+            `${autoLoaded ? "auto-loaded" : "hint only"}: ${autoLoaded ?? choice.id}` +
+              (choice.rest.length ? ` (others: ${choice.rest.join(", ")})` : ""),
+          )
         } catch (e) {
           logLine(`prompt hook error: ${String(e)}`)
         }

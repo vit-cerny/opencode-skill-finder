@@ -17,7 +17,6 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $targets = @(
   @{ src = "skills\skill-finder\SKILL.md"; dst = "skills\skill-finder\SKILL.md" },
-  @{ src = "commands\skillfinder.md";      dst = "commands\skillfinder.md" },
   @{ src = "scripts\skill-find.ps1";       dst = "scripts\skill-find.ps1" },
   @{ src = "plugins\skill-hint.ts";        dst = "plugins\skill-hint.ts" }
 )
@@ -30,6 +29,14 @@ foreach ($t in $targets) {
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
   Copy-Item $s $d -Force
   Write-Output "installed $($t.dst)"
+}
+
+# every command file, so new ones are picked up without editing this script
+foreach ($c in (Get-ChildItem (Join-Path $here "commands") -Filter *.md -ErrorAction SilentlyContinue)) {
+  $d = Join-Path $ConfigRoot "commands\$($c.Name)"
+  if (-not (Test-Path (Split-Path -Parent $d))) { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $d) | Out-Null }
+  Copy-Item $c.FullName $d -Force
+  Write-Output "installed commands\$($c.Name)"
 }
 
 $script = Join-Path $ConfigRoot "scripts\skill-find.ps1"

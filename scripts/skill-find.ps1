@@ -30,6 +30,8 @@ param(
   [int]$Top = 3,
   [switch]$List,
   [switch]$Commands,
+  [int]$Log = 0,
+  [switch]$Doctor,
   [string]$Use = "",
   [switch]$Enable,
   [switch]$Restore,
@@ -197,6 +199,57 @@ function Show-Commands {
       Write-Output ("  /{0,-28} {1}" -f $_.BaseName, $desc)
     }
   }
+}
+
+# Tail of the plugin's audit log: what was auto-loaded or hinted, and when.
+function Show-Log {
+  param([int]$Lines)
+  $f = Join-Path $ConfigRoot "skill-hint.log"
+  if (-not (Test-Path $f)) {
+    Write-Output "no log yet ($f). the plugin writes a line per delivered hint."
+    return
+  }
+  if ($Lines -le 0) { $Lines = 20 }
+  Write-Output ("last {0} lines of {1}:" -f $Lines, $f)
+  Get-Content $f -Tail $Lines
+}
+
+# One-screen health check. Every number here is measured, not assumed.
+function Invoke-Doctor {
+  $index = Write-Index
+  $adv = @($index | Where-Object { -not $_.hidden })
+  $hid = @($index | Where-Object { $_.hidden })
+  $a = ($adv | ForEach-Object { $_.desc.Length } | Measure-Object -Sum).Sum; if (-not $a) { $a = 0 }
+  $h = ($hid | ForEach-Object { $_.desc.Length } | Measure-Object -Sum).Sum; if (-not $h) { $h = 0 }
+
+  Write-Output "== skill-finder doctor =="
+  Write-Output ("skills on disk        : {0}" -f $index.Count)
+  Write-Output ("advertised            : {0}  ({1} chars ~{2} tokens/request)" -f $adv.Count, $a, [int]($a / 4))
+  Write-Output ("hidden                : {0}  (would cost ~{1} tokens if advertised)" -f $hid.Count, [int](($a + $h) / 4))
+  Write-Output ("index cache           : {0}" -f $IndexFile)
+  $state = Join-Path $ConfigRoot "skill-finder-state.json"
+  Write-Output ("frontmatter edits     : {0}" -f $(if (Test-Path $state) { (@((Get-Content $state -Raw | ConvertFrom-Json).edited)).Count } else { 0 }))
+
+  # Which skills are advertised, and is the finder among them?
+  $finderAdv = @($adv | Where-Object { $_.id -eq "skill-finder" }).Count -gt 0
+  Write-Output ("finder advertised     : {0}" -f $(if ($finderAdv) { "yes" } else { "NO - run -Enable after editing its frontmatter" }))
+
+  # Plugin health, straight from the running server.
+  try {
+    $raw = (opencode api GET /api/plugin 2>$null | Out-String)
+    if ($raw -and $raw.Trim().StartsWith("{")) {
+      $plugins = @((($raw | ConvertFrom-Json).data) | Where-Object { $_.source.type -ne "builtin" })
+      foreach ($p in $plugins) {
+        $name = if ($p.id) { $p.id } else { "(no id - wrong export shape)" }
+        Write-Output ("plugin {0,-24}: {1}{2}" -f $name, $p.state.status, $(if ($p.state.error) { "  -> " + $p.state.error } else { "" }))
+      }
+    } else { Write-Output "plugin check          : server not reachable" }
+  } catch { Write-Output "plugin check          : server not reachable" }
+
+  $log = Join-Path $ConfigRoot "skill-hint.log"
+  Write-Output ("log                   : {0}" -f $(if (Test-Path $log) { "$((Get-Item $log).Length) bytes" } else { "none yet" }))
+  Write-Output ""
+  Write-Output "next: -Task ""<task>"" to find, -List for everything, -Enable after any skill sync."
 }
 
 function Show-One {
@@ -419,6 +472,8 @@ if ($Demote) {
 }
 if ($Status -or $Rebuild) { Invoke-Status; exit 0 }
 if ($Commands) { Show-Commands; exit 0 }
+if ($Doctor) { Invoke-Doctor; exit 0 }
+if ($Log -gt 0) { Show-Log -Lines $Log; exit 0 }
 if ($List) { Write-Index | Out-Null; Write-Output "all skills on disk:"; Show-Compact -Index (Get-SkillIndex); exit 0 }
 if ($Use) {
   if (-not ((Get-SkillIndex) | Where-Object { $_.id -eq $Use })) { Write-Output "unknown skill: $Use"; exit 1 }

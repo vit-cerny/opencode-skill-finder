@@ -57,29 +57,43 @@ Manual install is the same thing by hand:
 
 then run `scripts/skill-find.ps1 -Enable`.
 
-## Usage
+## How do I use it?
 
-From a slash command:
+Nothing to remember. When a prompt matches a skill, the model is told which one
+to load, and you will see it happen. The commands exist for when you want to look
+or steer.
+
+**Day to day** — just ask. If a skill matches, it gets used. To see what happened:
 
 ```
-/skillfinder add a playwright test for checkout   # resolve + load one skill
-/skillfinder skills                               # list every skill
-/skillfinder commands                             # list every command
-/skillfinder status                               # token accounting + usage table
-/skillfinder promote                              # skills used >= 5x become always-advertised
-/skillfinder enable                               # re-hide after a skill sync
-/skillfinder restore                              # unhide everything
-/skillfinder add <owner/repo>                     # npx skills add, then re-hide
+/skilllog        # what was auto-loaded or hinted recently
+/skillstats      # token accounting
+/skilldoctor     # health check: plugin loaded? finder still advertised? token cost?
 ```
 
-Or call the script directly:
+**When you want control:**
+
+```
+/skills                    # list every skill you have
+/skill refactor this module into smaller files   # find + load the best skill, then do it
+/skillpromote              # show usage, then make frequently used skills always-advertised
+/skillpromote 3            # same, with a threshold of 3 uses
+```
+
+**When you add skills:**
+
+```
+/skillfinder add some-owner/some-repo   # npx skills add, then re-hide the new ones
+```
+
+**Everything at once** — `/skillfinder <task|skills|commands|stats|log|doctor|enable|restore|promote|demote <id>|add <repo>>`.
+
+Or call the script directly, from anywhere:
 
 ```powershell
-sk = "$env:USERPROFILE\.config\opencode\scripts\skill-find.ps1"
+$sk = "$env:USERPROFILE\.config\opencode\scripts\skill-find.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File $sk -Task "<the task>"
-powershell -NoProfile -ExecutionPolicy Bypass -File $sk -List
-powershell -NoProfile -ExecutionPolicy Bypass -File $sk -Use web-design-engineer -Task "<the task>"
-powershell -NoProfile -ExecutionPolicy Bypass -File $sk -Promote -Threshold 5
+powershell -NoProfile -ExecutionPolicy Bypass -File $sk -Doctor
 ```
 
 | Flag | Does |
@@ -87,6 +101,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $sk -Promote -Threshold 5
 | `-Task "<text>"` | Keyword-filter the index, print the matches (default `-Top 3`) |
 | `-List` | Compact one-line-per-skill index, on demand |
 | `-Commands` | Every command the running server exposes, plus built-ins |
+| `-Doctor` | Health check: counts, token cost, plugin status, log size |
+| `-Log [n]` | Tail of the audit log (default 20 lines) |
 | `-Use <id> -Task "<text>"` | Record a use, feeding `-Promote` |
 | `-Promote [-Threshold n]` | Unhide skills used >= n times (default 5) |
 | `-Demote <id>` | Hide one again |
@@ -94,6 +110,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $sk -Promote -Threshold 5
 | `-Status` | Token accounting, usage table, what is still advertised |
 | `-Online` | Also query the skills.sh catalog |
 | `-Top n` | How many matches to print |
+
+## Will it waste tokens?
+
+Measured on this machine, 53 skills:
+
+| | Tokens |
+|---|---|
+| Before: every skill advertised | **4,124 per request**, whether or not you use a skill |
+| After: one finder advertised | **61 per request** — the 52 others are hidden |
+| The hint (when skills match) | ~90 per turn, once |
+| Auto-load (only when you name a skill) | the one skill's body |
+
+So the standing cost drops by 98.5%, and the only new cost is per-turn and
+proportional to actually using something. Skill bodies are still never loaded
+just because a skill exists — that is the whole point of hiding them.
+
+The finder can print the full index on demand (~1,400 tokens for 53 skills) when
+keyword matching is ambiguous. That is a fallback you ask for, not a tax you pay
+every request.
+
 
 ## How it works
 
@@ -109,28 +145,34 @@ Reads frontmatter only, never skill bodies. Writes a cached
 **`plugins/skill-hint.ts`** — makes it automatic. It registers two opencode V2
 session hooks in `setup()`:
 
-- `prompt` — on prompt admission, keyword-filters the same index against the
-  incoming text and stashes a shortlist for that session.
-- `context` — on the next model call, pushes the shortlist into the system
-  prompt (`event.system`), then clears it, so tool-driven continuations do not
-  pay for it again.
+- `prompt` — on prompt admission, filters the same index against the incoming
+  text and picks a skill. If the prompt names a skill whose id token is **unique**
+  across all skill ids (e.g. "run ponytail", "make a graphify graph"), that skill
+  is pushed onto `event.prompt.skills`, which opencode resolves natively — it is
+  genuinely loaded, once, with no model discretion and no extra tool call.
+  Otherwise a shortlist is queued as a hint.
+- `context` — on the next model call, pushes that hint into the system prompt
+  (`event.system`), then clears it, so tool-driven continuations do not pay for
+  it again.
 
-The model sees one line, and still chooses and loads exactly one skill by id:
+The hint is worded as a requirement, so a matching task reliably loads something:
 
 ```
-[skill-hint] skill candidates: security-review, xlsx, ai-prompt-engineering-safety-review.
-Load exactly one with the skill tool before specialized work - they are hidden
-to save context but still load by id. Need a different one: skill-find.ps1 -Task
-"<task>" or -List.
+[skill-hint] MANDATORY before any other tool call: load exactly one of these
+with the skill tool - security-review, code-review-and-quality - or state in one
+line why none of them applies to this task.
 ```
 
-~40 tokens per turn, versus ~4,124 per request for the full index. Every
-delivery is appended to `~/.config/opencode/skill-hint.log`, so you can see what
-was suggested and when. The plugin never throws: a plugin error must not break a
-session.
+Every delivery is appended to `~/.config/opencode/skill-hint.log`:
 
-Nothing is added to your message — the hint lives in the system prompt, so your
-transcript stays clean.
+```
+2026-10-15T20:19:32.660Z auto-loaded: find-skills (others: playwright, xlsx)
+2026-10-15T20:20:02.261Z delivered: find-skills is already loaded for this task...
+```
+
+The plugin never throws: a plugin error must not break a session. Nothing is
+added to your message — the hint lives in the system prompt, so your transcript
+stays clean.
 
 ## What is deliberately not here
 
@@ -150,28 +192,41 @@ it is already in the conversation.
 bun run test/skill-hint.test.ts
 ```
 
-14 checks: index builds, hidden flags parse, stemming, three real task-to-skill
-mappings, short-text and marker dedupe, no match on chit-chat, hint size.
+21 checks: index builds, hidden flags parse, stemming, three real task-to-skill
+mappings, short-text and marker dedupe, no match on chit-chat, and six
+auto-load precision guards.
 
 Verified end to end on a live server, not inferred:
 
 | Check | Evidence |
 |---|---|
 | Plugin loads | `opencode api GET /api/plugin` → `id=skill-hint status=active` |
-| Hooks fire | `skill-hint.log` shows `prompt: ... hint=yes` then `delivered: ...` |
+| Hooks fire | `skill-hint.log` shows the prompt hook and the delivery |
 | The model sees it | a subagent was asked to quote any line containing "candidates" and returned the hint verbatim |
 | Delivered once per turn | later model calls log nothing; `pending` is cleared after delivery |
-| Hiding works | full finder scan reports 53 skills, 1 advertised, 61 tokens/request |
+| Hiding works | `-Status` reports 53 skills, 1 advertised, 61 tokens/request |
 | Hidden skill still loadable | `skill` tool called with `ponytail` while hidden returned its full body |
+| Auto-load is precise | 4 correct auto-loads when a skill is named; 3 guards prove it does *not* fire on loose keyword matches |
 
-The hide/restore round-trip was verified byte-identical across 78 `SKILL.md`
-files (56 CRLF, 22 LF) using SHA256. Bugs found and fixed along the way:
+The auto-load gate was rewritten twice against real failures, both caught in
+`skill-hint.log` rather than by reasoning:
+
+1. A match-count gate auto-loaded `jev-browser` for "build a settings page with a
+   dark mode toggle" and `karpathy-guidelines` for "write a changelog".
+2. An id-token gate auto-loaded `find-skills` for a prompt that merely contained
+   the word "skills", because `skill` appears in several skill ids.
+
+Both are now regression tests. Requiring a *unique* id token fixes them, and
+explicit naming is checked across all candidates, so naming `security-review`
+wins over a higher-ranked `ai-prompt-engineering-safety-review`.
+
+Other bugs found and fixed:
 
 - PowerShell 5.1 `Set-Content -Encoding UTF8` writes a **BOM**, which breaks
   `---` frontmatter parsing. All writes go through
   `New-Object System.Text.UTF8Encoding($false)`.
 - Hardcoding CRLF on insert broke byte-identity on LF files. The insert reuses
-  the file's own line ending.
+  the file's own line ending — verified SHA256-identical across 78 files.
 - The plugin was first written against the V1 plugin API and silently failed to
   load. V2 needs `Plugin.define({ id, setup })` as the default export from
   `@opencode/plugin`.
