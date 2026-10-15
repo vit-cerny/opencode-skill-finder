@@ -120,6 +120,13 @@ to save context but still load by id.
 still chooses and loads one skill; the plugin only supplies the shortlist. It
 never throws - a plugin error must not break a session.
 
+**Design tradeoff:** the hint is appended to the incoming user message, so it is
+visible in the transcript rather than hidden in the system prompt. That is
+deliberate - you can see which skills were suggested and why. The alternative is
+to stash it in `chat.message` and inject it in
+`experimental.chat.system.transform`, which keeps your message clean but adds an
+ordering assumption between the two hooks.
+
 ## What is deliberately not here
 
 An earlier version ranked skills with a BM25-style scorer over their
