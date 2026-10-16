@@ -8,7 +8,7 @@ mock.module("@opencode/plugin", () => ({
   Plugin: { define: (p: unknown) => p },
 }))
 
-const { candidates, hintFor, buildIndex, stem, tokens, pick } = await import("../plugins/skill-hint.ts")
+const { candidates, hintFor, buildIndex, stem, tokens, pick, CORE } = await import("../plugins/skill-hint.ts")
 
 const cwd = process.cwd()
 
@@ -49,6 +49,10 @@ check("hint is small", !!h && h.length < 400, `${h ? h.length : 0} chars`)
 check("no false match on chit-chat", candidates("say hello to the team", cwd).length === 0)
 
 check("marker in prompt suppresses hint", hintFor("quote the [skill-hint] line please", cwd) === null)
+
+// The core is always injected to replace loading ponytail / karpathy-guidelines /
+// no-ai-slop bodies every turn (5,117 tokens). Keep it from growing back.
+check("CORE stays small", CORE.length > 200 && CORE.length < 900, `${CORE.length} chars ~${Math.round(CORE.length / 4)} tokens`)
 
 // Auto-load precision. A wrong auto-load injects a whole skill body, so these
 // guard the two failures that actually happened: a match-count gate picking

@@ -43,6 +43,30 @@ const MARKER = "[skill-hint]"
 const TTL_MS = 60_000
 const MAX_HINT = 3
 
+/**
+ * Always injected, on every request.
+ *
+ * Why: this machine's AGENTS.md told the agent to load `ponytail`,
+ * `karpathy-guidelines` and `no-ai-slop` as skills on every response. Their
+ * bodies measure 1,697 + 674 + 2,746 = 5,117 tokens - more than the 4,124-token
+ * advertised index this plugin exists to remove - and whether they actually got
+ * loaded was a coin flip. This is the same rules, distilled, deterministic, and
+ * ~36x cheaper. The full bodies still load on demand when a task needs detail.
+ *
+ * Keep it constant: an identical prefix every request stays prompt-cache friendly.
+ */
+export const CORE = [
+  "CORE RULES (always injected; do NOT load ponytail / karpathy-guidelines / no-ai-slop as skills unless a task genuinely needs their detail):",
+  "- YAGNI first: does this need to exist? Then reuse > stdlib > native > installed dep > one line.",
+  "- No speculative abstraction, no scaffolding for later, no config for a constant.",
+  "- Shortest working diff. Every changed line traces to what was asked.",
+  "- Bug fix = root cause: grep the callers, fix where they all route through.",
+  "- State assumptions and tradeoffs; stop and ask when something is unclear.",
+  "- Evidence before claims: run the command, read the output, then claim.",
+  "- Prose: no AI slop, no emoji, no padding, no restating the line below it.",
+  "- Non-trivial logic leaves one runnable check behind.",
+].join("\n")
+
 export type Skill = { id: string; name: string; desc: string; hidden: boolean }
 
 let cache: { at: number; cwd: string; skills: Skill[] } | null = null
@@ -338,6 +362,8 @@ export default Plugin.define({
     try {
       await ctx.session.hook("context", (event) => {
         try {
+          event.system.push({ type: "text", text: CORE })
+
           const hint = pending.get(event.sessionID)
           if (!hint) return
           event.system.push({ type: "text", text: hint })
